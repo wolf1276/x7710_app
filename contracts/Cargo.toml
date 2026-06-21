@@ -1,0 +1,10 @@
+# contracts/Cargo.toml
+
+[workspace]
+members = [
+    "policy-engine",
+    "delegation-manager",
+    "execution-router"
+]
+
+resolver = "2"
