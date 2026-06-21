@@ -50,3 +50,6 @@ env/.env.*
 # typescript
 *.tsbuildinfo
 frontend/next-env.d.ts
+
+# Rust / Cargo
+/contracts/target/
