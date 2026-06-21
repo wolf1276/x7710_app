@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Vec,
+    contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,8 +47,57 @@ pub enum DataKey {
     ActiveDelegation(Address, Address),
 }
 
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_LIMIT: u32 = 500_000;
+
+fn bump_ttl(env: &Env, key: &DataKey) {
+    env.storage().persistent().extend_ttl(key, BUMP_THRESHOLD, BUMP_LIMIT);
+}
+
 #[contract]
 pub struct DelegationManager;
+
+impl DelegationManager {
+    fn ensure_not_expired(env: &Env, delegation_id: u64) {
+        let key = DataKey::Delegation(delegation_id);
+        if let Some(mut delegation) = env.storage().persistent().get::<_, Delegation>(&key) {
+            let now = env.ledger().timestamp();
+            if let Some(exp) = delegation.expires_at {
+                if exp <= now
+                    && delegation.status != DelegationStatus::Revoked
+                    && delegation.status != DelegationStatus::Expired
+                {
+                    delegation.status = DelegationStatus::Expired;
+                    delegation.version = delegation.version.checked_add(1).expect("version overflow");
+                    delegation.updated_at = now;
+
+                    // Remove ActiveDelegation mapping
+                    let active_key = DataKey::ActiveDelegation(delegation.owner.clone(), delegation.delegate.clone());
+                    if let Some(existing_id) = env.storage().persistent().get::<_, u64>(&active_key) {
+                        if existing_id == delegation_id {
+                            env.storage().persistent().remove(&active_key);
+                        }
+                    }
+
+                    // Persist
+                    env.storage().persistent().set(&key, &delegation);
+
+                    // Emit event
+                    env.events().publish(
+                        (
+                            Symbol::new(env, "delegation_expired"),
+                            delegation_id,
+                            delegation.owner.clone(),
+                            delegation.delegate.clone(),
+                        ),
+                        (now, delegation.version),
+                    );
+                }
+            }
+            bump_ttl(env, &key);
+        }
+    }
+}
 
 #[contractimpl]
 impl DelegationManager {
@@ -99,8 +148,9 @@ impl DelegationManager {
             .persistent()
             .get::<_, u64>(&DataKey::Counter)
             .unwrap_or(0);
-        counter += 1;
+        counter = counter.checked_add(1).expect("version overflow");
         env.storage().persistent().set(&DataKey::Counter, &counter);
+        bump_ttl(&env, &DataKey::Counter);
 
         let delegation_id = counter;
 
@@ -120,17 +170,18 @@ impl DelegationManager {
         };
 
         // Save Delegation
-        env.storage()
-            .persistent()
-            .set(&DataKey::Delegation(delegation_id), &delegation);
+        let del_key = DataKey::Delegation(delegation_id);
+        env.storage().persistent().set(&del_key, &delegation);
+        bump_ttl(&env, &del_key);
 
         // Update active delegation registry
         env.storage().persistent().set(&active_key, &delegation_id);
+        bump_ttl(&env, &active_key);
 
-        // Emit Event V2
+        // Emit Event
         env.events().publish(
             (
-                symbol_short!("created"),
+                Symbol::new(&env, "delegation_created"),
                 delegation_id,
                 owner.clone(),
                 delegate.clone(),
@@ -165,15 +216,20 @@ impl DelegationManager {
         }
 
         delegation.status = DelegationStatus::Active;
-        delegation.version += 1;
+        delegation.version = delegation.version.checked_add(1).expect("version overflow");
         delegation.updated_at = now;
 
         env.storage().persistent().set(&key, &delegation);
+        bump_ttl(&env, &key);
 
-        // Emit Event V2
+        let active_key = DataKey::ActiveDelegation(delegation.owner.clone(), delegation.delegate.clone());
+        env.storage().persistent().set(&active_key, &delegation_id);
+        bump_ttl(&env, &active_key);
+
+        // Emit Event
         env.events().publish(
             (
-                symbol_short!("accepted"),
+                Symbol::new(&env, "delegation_accepted"),
                 delegation_id,
                 delegation.owner.clone(),
                 delegation.delegate.clone(),
@@ -199,11 +255,12 @@ impl DelegationManager {
 
         let now = env.ledger().timestamp();
         delegation.status = DelegationStatus::Revoked;
-        delegation.version += 1;
+        delegation.version = delegation.version.checked_add(1).expect("version overflow");
         delegation.revoked_at = Some(now);
         delegation.updated_at = now;
 
         env.storage().persistent().set(&key, &delegation);
+        bump_ttl(&env, &key);
 
         // Remove from active registry mapping
         let active_key = DataKey::ActiveDelegation(delegation.owner.clone(), delegation.delegate.clone());
@@ -213,10 +270,10 @@ impl DelegationManager {
             }
         }
 
-        // Emit Event V2
+        // Emit Event
         env.events().publish(
             (
-                symbol_short!("revoked"),
+                Symbol::new(&env, "delegation_revoked"),
                 delegation_id,
                 delegation.owner.clone(),
                 delegation.delegate.clone(),
@@ -242,11 +299,12 @@ impl DelegationManager {
 
         let now = env.ledger().timestamp();
         delegation.status = DelegationStatus::Revoked;
-        delegation.version += 1;
+        delegation.version = delegation.version.checked_add(1).expect("version overflow");
         delegation.revoked_at = Some(now);
         delegation.updated_at = now;
 
         env.storage().persistent().set(&key, &delegation);
+        bump_ttl(&env, &key);
 
         // Remove from active registry mapping
         let active_key = DataKey::ActiveDelegation(delegation.owner.clone(), delegation.delegate.clone());
@@ -256,10 +314,10 @@ impl DelegationManager {
             }
         }
 
-        // Emit Event V2
+        // Emit Event
         env.events().publish(
             (
-                symbol_short!("renounced"),
+                Symbol::new(&env, "delegation_renounced"),
                 delegation_id,
                 delegation.owner.clone(),
                 delegation.delegate.clone(),
@@ -270,6 +328,8 @@ impl DelegationManager {
 
     /// Owner temporarily disables a delegation.
     pub fn pause_delegation(env: Env, delegation_id: u64) {
+        Self::ensure_not_expired(&env, delegation_id);
+
         let key = DataKey::Delegation(delegation_id);
         let mut delegation = env
             .storage()
@@ -292,16 +352,17 @@ impl DelegationManager {
         }
 
         delegation.status = DelegationStatus::Paused;
-        delegation.version += 1;
+        delegation.version = delegation.version.checked_add(1).expect("version overflow");
         delegation.paused_at = Some(now);
         delegation.updated_at = now;
 
         env.storage().persistent().set(&key, &delegation);
+        bump_ttl(&env, &key);
 
-        // Emit Event V2
+        // Emit Event
         env.events().publish(
             (
-                symbol_short!("paused"),
+                Symbol::new(&env, "delegation_paused"),
                 delegation_id,
                 delegation.owner.clone(),
                 delegation.delegate.clone(),
@@ -312,6 +373,8 @@ impl DelegationManager {
 
     /// Owner re-enables a paused delegation.
     pub fn resume_delegation(env: Env, delegation_id: u64) {
+        Self::ensure_not_expired(&env, delegation_id);
+
         let key = DataKey::Delegation(delegation_id);
         let mut delegation = env
             .storage()
@@ -334,16 +397,17 @@ impl DelegationManager {
         }
 
         delegation.status = DelegationStatus::Active;
-        delegation.version += 1;
+        delegation.version = delegation.version.checked_add(1).expect("version overflow");
         delegation.resumed_at = Some(now);
         delegation.updated_at = now;
 
         env.storage().persistent().set(&key, &delegation);
+        bump_ttl(&env, &key);
 
-        // Emit Event V2
+        // Emit Event
         env.events().publish(
             (
-                symbol_short!("resumed"),
+                Symbol::new(&env, "delegation_resumed"),
                 delegation_id,
                 delegation.owner.clone(),
                 delegation.delegate.clone(),
@@ -354,6 +418,8 @@ impl DelegationManager {
 
     /// Owner updates delegation metadata.
     pub fn update_metadata(env: Env, delegation_id: u64, metadata: DelegationMetadata) {
+        Self::ensure_not_expired(&env, delegation_id);
+
         let key = DataKey::Delegation(delegation_id);
         let mut delegation = env
             .storage()
@@ -376,15 +442,16 @@ impl DelegationManager {
         }
 
         delegation.metadata = metadata;
-        delegation.version += 1;
+        delegation.version = delegation.version.checked_add(1).expect("version overflow");
         delegation.updated_at = now;
 
         env.storage().persistent().set(&key, &delegation);
+        bump_ttl(&env, &key);
 
-        // Emit Event V2
+        // Emit Event
         env.events().publish(
             (
-                symbol_short!("updated"),
+                Symbol::new(&env, "delegation_updated"),
                 delegation_id,
                 delegation.owner.clone(),
                 delegation.delegate.clone(),
@@ -404,9 +471,10 @@ impl DelegationManager {
                     && delegation.status != DelegationStatus::Expired 
                 {
                     delegation.status = DelegationStatus::Expired;
-                    delegation.version += 1;
+                    delegation.version = delegation.version.checked_add(1).expect("version overflow");
                     delegation.updated_at = now;
                     env.storage().persistent().set(&key, &delegation);
+                    bump_ttl(&env, &key);
 
                     // Remove from active registry mapping
                     let active_key = DataKey::ActiveDelegation(delegation.owner.clone(), delegation.delegate.clone());
@@ -419,7 +487,7 @@ impl DelegationManager {
                     // Emit expired event
                     env.events().publish(
                         (
-                            symbol_short!("expired"),
+                            Symbol::new(&env, "delegation_expired"),
                             delegation_id,
                             delegation.owner.clone(),
                             delegation.delegate.clone(),
@@ -429,6 +497,7 @@ impl DelegationManager {
                     return true;
                 }
             }
+            bump_ttl(&env, &key);
         }
         false
     }
@@ -436,16 +505,25 @@ impl DelegationManager {
     // --- Read Functions & Validation APIs ---
 
     pub fn get_delegation(env: Env, delegation_id: u64) -> Option<Delegation> {
-        env.storage()
-            .persistent()
-            .get::<_, Delegation>(&DataKey::Delegation(delegation_id))
+        let key = DataKey::Delegation(delegation_id);
+        let val = env.storage().persistent().get::<_, Delegation>(&key);
+        if val.is_some() {
+            bump_ttl(&env, &key);
+        }
+        val
     }
 
     pub fn delegation_exists(env: Env, delegation_id: u64) -> bool {
-        env.storage().persistent().has(&DataKey::Delegation(delegation_id))
+        let key = DataKey::Delegation(delegation_id);
+        let has = env.storage().persistent().has(&key);
+        if has {
+            bump_ttl(&env, &key);
+        }
+        has
     }
 
     pub fn is_active_delegation(env: Env, delegation_id: u64) -> bool {
+        Self::ensure_not_expired(&env, delegation_id);
         if let Some(delegation) = Self::get_delegation(env.clone(), delegation_id) {
             let now = env.ledger().timestamp();
             let is_expired = delegation.status == DelegationStatus::Expired 
@@ -496,11 +574,31 @@ impl DelegationManager {
 
     pub fn get_active_delegation_id(env: Env, owner: Address, delegate: Address) -> Option<u64> {
         let active_key = DataKey::ActiveDelegation(owner, delegate);
-        env.storage().persistent().get::<_, u64>(&active_key)
+        if let Some(id) = env.storage().persistent().get::<_, u64>(&active_key) {
+            bump_ttl(&env, &active_key);
+            // Ensure we never return an expired delegation
+            Self::ensure_not_expired(&env, id);
+            if let Some(delegation) = Self::get_delegation(env.clone(), id) {
+                if delegation.status == DelegationStatus::Expired {
+                    return None;
+                }
+                let now = env.ledger().timestamp();
+                let is_exp = delegation.status == DelegationStatus::Expired 
+                    || (delegation.expires_at.is_some() && delegation.expires_at.unwrap() <= now);
+                if is_exp {
+                    env.storage().persistent().remove(&active_key);
+                    return None;
+                }
+            }
+            Some(id)
+        } else {
+            None
+        }
     }
 
     pub fn verify_authority(env: Env, owner: Address, delegate: Address) -> bool {
-        if let Some(id) = Self::get_active_delegation_id(env.clone(), owner, delegate) {
+        if let Some(id) = Self::get_active_delegation_id(env.clone(), owner.clone(), delegate.clone()) {
+            Self::ensure_not_expired(&env, id);
             Self::is_active_delegation(env, id)
         } else {
             false
@@ -508,7 +606,8 @@ impl DelegationManager {
     }
 
     pub fn get_active_delegation(env: Env, owner: Address, delegate: Address) -> Option<Delegation> {
-        let id = Self::get_active_delegation_id(env.clone(), owner, delegate)?;
+        let id = Self::get_active_delegation_id(env.clone(), owner.clone(), delegate.clone())?;
+        Self::ensure_not_expired(&env, id);
         let delegation = Self::get_delegation(env.clone(), id)?;
         let now = env.ledger().timestamp();
         let is_expired = delegation.status == DelegationStatus::Expired 
@@ -522,6 +621,7 @@ impl DelegationManager {
 
     pub fn get_delegation_by_pair(env: Env, owner: Address, delegate: Address) -> Option<Delegation> {
         let id = Self::get_active_delegation_id(env.clone(), owner, delegate)?;
+        Self::ensure_not_expired(&env, id);
         Self::get_delegation(env, id)
     }
 

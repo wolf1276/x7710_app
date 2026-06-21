@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String, Vec, Symbol,
+    contract, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,8 +73,56 @@ pub mod delegation_manager_client {
     }
 }
 
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_LIMIT: u32 = 500_000;
+
+fn bump_ttl(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage().persistent().extend_ttl(key, BUMP_THRESHOLD, BUMP_LIMIT);
+    }
+}
+
 #[contract]
 pub struct PolicyEngine;
+
+impl PolicyEngine {
+    fn ensure_not_expired(env: &Env, policy_id: u64) {
+        let key = DataKey::Policy(policy_id);
+        if let Some(mut policy) = env.storage().persistent().get::<_, Policy>(&key) {
+            let now = env.ledger().timestamp();
+            if let Some(until) = policy.params.valid_until {
+                if until <= now
+                    && policy.status != PolicyStatus::Revoked
+                    && policy.status != PolicyStatus::Expired
+                {
+                    policy.status = PolicyStatus::Expired;
+                    policy.version = policy.version.checked_add(1).expect("version overflow");
+                    policy.updated_at = now;
+
+                    // Remove from ActivePolicyId
+                    if let Some(del_id) = policy.delegation_id {
+                        let active_key = DataKey::ActivePolicyId(del_id);
+                        if let Some(act_id) = env.storage().persistent().get::<_, u64>(&active_key) {
+                            if act_id == policy_id {
+                                env.storage().persistent().remove(&active_key);
+                            }
+                        }
+                    }
+
+                    // Save
+                    env.storage().persistent().set(&key, &policy);
+
+                    // Emit event
+                    env.events().publish(
+                        (Symbol::new(env, "policy_expired"), policy_id, policy.owner.clone(), policy.delegate.clone()),
+                        (now, policy.version),
+                    );
+                }
+            }
+            bump_ttl(env, &key);
+        }
+    }
+}
 
 #[contractimpl]
 impl PolicyEngine {
@@ -84,39 +132,64 @@ impl PolicyEngine {
         }
         env.storage().persistent().set(&DataKey::DelegationManager, &delegation_manager);
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::Counter, &0u64);
+
+        bump_ttl(&env, &DataKey::DelegationManager);
+        bump_ttl(&env, &DataKey::Admin);
+        bump_ttl(&env, &DataKey::Counter);
     }
 
     pub fn get_delegation_manager(env: Env) -> Address {
-        env.storage().persistent().get::<_, Address>(&DataKey::DelegationManager)
-            .unwrap_or_else(|| panic!("not initialized"))
+        let key = DataKey::DelegationManager;
+        let addr = env.storage().persistent().get::<_, Address>(&key)
+            .unwrap_or_else(|| panic!("not initialized"));
+        bump_ttl(&env, &key);
+        addr
     }
 
     pub fn get_admin(env: Env) -> Address {
-        env.storage().persistent().get::<_, Address>(&DataKey::Admin)
-            .unwrap_or_else(|| panic!("not initialized"))
+        let key = DataKey::Admin;
+        let addr = env.storage().persistent().get::<_, Address>(&key)
+            .unwrap_or_else(|| panic!("not initialized"));
+        bump_ttl(&env, &key);
+        addr
     }
 
     pub fn set_execution_router(env: Env, router: Address) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::ExecutionRouter, &router);
+        let key = DataKey::ExecutionRouter;
+        env.storage().persistent().set(&key, &router);
+        bump_ttl(&env, &key);
     }
 
     pub fn get_execution_router(env: Env) -> Option<Address> {
-        env.storage().persistent().get::<_, Address>(&DataKey::ExecutionRouter)
+        let key = DataKey::ExecutionRouter;
+        let val = env.storage().persistent().get::<_, Address>(&key);
+        if val.is_some() {
+            bump_ttl(&env, &key);
+        }
+        val
     }
 
     pub fn get_remaining_daily_limit(env: Env, delegation_id: u64, timestamp: u64) -> u128 {
-        let active_id = match env.storage().persistent().get::<_, u64>(&DataKey::ActivePolicyId(delegation_id)) {
+        let active_key = DataKey::ActivePolicyId(delegation_id);
+        let active_id = match env.storage().persistent().get::<_, u64>(&active_key) {
             Some(id) => id,
             None => return 0,
         };
+        bump_ttl(&env, &active_key);
+        Self::ensure_not_expired(&env, active_id);
+
         let policy = match Self::get_policy(env.clone(), active_id) {
             Some(p) => p,
             None => return 0,
         };
         let day_id = timestamp / 86400;
-        let spent = env.storage().persistent().get::<_, u128>(&DataKey::DailyNotional(active_id, day_id)).unwrap_or(0);
+        let daily_key = DataKey::DailyNotional(active_id, day_id);
+        let spent = env.storage().persistent().get::<_, u128>(&daily_key).unwrap_or(0);
+        bump_ttl(&env, &daily_key);
+
         if spent >= policy.params.max_notional_per_day {
             0
         } else {
@@ -140,8 +213,9 @@ impl PolicyEngine {
         }
 
         let mut counter = env.storage().persistent().get::<_, u64>(&DataKey::Counter).unwrap_or(0);
-        counter += 1;
+        counter = counter.checked_add(1).expect("version overflow");
         env.storage().persistent().set(&DataKey::Counter, &counter);
+        bump_ttl(&env, &DataKey::Counter);
 
         let policy = Policy {
             id: counter,
@@ -155,7 +229,9 @@ impl PolicyEngine {
             version: 1,
         };
 
-        env.storage().persistent().set(&DataKey::Policy(counter), &policy);
+        let key = DataKey::Policy(counter);
+        env.storage().persistent().set(&key, &policy);
+        bump_ttl(&env, &key);
 
         env.events().publish(
             (Symbol::new(&env, "policy_created"), counter, owner, delegate),
@@ -178,14 +254,26 @@ impl PolicyEngine {
 
         let now = env.ledger().timestamp();
         policy.status = PolicyStatus::Active;
-        policy.version += 1;
+        policy.version = policy.version.checked_add(1).expect("version overflow");
         policy.updated_at = now;
 
         env.storage().persistent().set(&key, &policy);
+        bump_ttl(&env, &key);
 
-        // If assigned, we update the active policy mapping
+        // If assigned, we update the active policy mapping (preventing multiple active policies)
         if let Some(del_id) = policy.delegation_id {
-            env.storage().persistent().set(&DataKey::ActivePolicyId(del_id), &policy_id);
+            let active_key = DataKey::ActivePolicyId(del_id);
+            if let Some(existing_id) = env.storage().persistent().get::<_, u64>(&active_key) {
+                if let Some(existing_policy) = Self::get_policy(env.clone(), existing_id) {
+                    let is_expired = existing_policy.status == PolicyStatus::Expired 
+                        || (existing_policy.params.valid_until.is_some() && existing_policy.params.valid_until.unwrap() <= now);
+                    if existing_policy.status == PolicyStatus::Active && !is_expired && existing_id != policy_id {
+                        panic!("delegation already has an active policy");
+                    }
+                }
+            }
+            env.storage().persistent().set(&active_key, &policy_id);
+            bump_ttl(&env, &active_key);
         }
 
         env.events().publish(
@@ -195,6 +283,8 @@ impl PolicyEngine {
     }
 
     pub fn pause_policy(env: Env, policy_id: u64) {
+        Self::ensure_not_expired(&env, policy_id);
+
         let key = DataKey::Policy(policy_id);
         let mut policy = env.storage().persistent().get::<_, Policy>(&key)
             .unwrap_or_else(|| panic!("policy not found"));
@@ -207,10 +297,11 @@ impl PolicyEngine {
 
         let now = env.ledger().timestamp();
         policy.status = PolicyStatus::Paused;
-        policy.version += 1;
+        policy.version = policy.version.checked_add(1).expect("version overflow");
         policy.updated_at = now;
 
         env.storage().persistent().set(&key, &policy);
+        bump_ttl(&env, &key);
 
         env.events().publish(
             (Symbol::new(&env, "policy_paused"), policy_id, policy.owner.clone(), policy.delegate.clone()),
@@ -219,6 +310,8 @@ impl PolicyEngine {
     }
 
     pub fn resume_policy(env: Env, policy_id: u64) {
+        Self::ensure_not_expired(&env, policy_id);
+
         let key = DataKey::Policy(policy_id);
         let mut policy = env.storage().persistent().get::<_, Policy>(&key)
             .unwrap_or_else(|| panic!("policy not found"));
@@ -231,10 +324,11 @@ impl PolicyEngine {
 
         let now = env.ledger().timestamp();
         policy.status = PolicyStatus::Active;
-        policy.version += 1;
+        policy.version = policy.version.checked_add(1).expect("version overflow");
         policy.updated_at = now;
 
         env.storage().persistent().set(&key, &policy);
+        bump_ttl(&env, &key);
 
         env.events().publish(
             (Symbol::new(&env, "policy_resumed"), policy_id, policy.owner.clone(), policy.delegate.clone()),
@@ -255,10 +349,11 @@ impl PolicyEngine {
 
         let now = env.ledger().timestamp();
         policy.status = PolicyStatus::Revoked;
-        policy.version += 1;
+        policy.version = policy.version.checked_add(1).expect("version overflow");
         policy.updated_at = now;
 
         env.storage().persistent().set(&key, &policy);
+        bump_ttl(&env, &key);
 
         if let Some(del_id) = policy.delegation_id {
             let active_key = DataKey::ActivePolicyId(del_id);
@@ -280,6 +375,8 @@ impl PolicyEngine {
         policy_id: u64,
         params: PolicyParams,
     ) {
+        Self::ensure_not_expired(&env, policy_id);
+
         let key = DataKey::Policy(policy_id);
         let mut policy = env.storage().persistent().get::<_, Policy>(&key)
             .unwrap_or_else(|| panic!("policy not found"));
@@ -292,10 +389,11 @@ impl PolicyEngine {
 
         let now = env.ledger().timestamp();
         policy.params = params;
-        policy.version += 1;
+        policy.version = policy.version.checked_add(1).expect("version overflow");
         policy.updated_at = now;
 
         env.storage().persistent().set(&key, &policy);
+        bump_ttl(&env, &key);
 
         env.events().publish(
             (Symbol::new(&env, "policy_updated"), policy_id, policy.owner.clone(), policy.delegate.clone()),
@@ -304,6 +402,8 @@ impl PolicyEngine {
     }
 
     pub fn assign_policy_to_delegation(env: Env, policy_id: u64, delegation_id: u64) {
+        Self::ensure_not_expired(&env, policy_id);
+
         let key = DataKey::Policy(policy_id);
         let mut policy = env.storage().persistent().get::<_, Policy>(&key)
             .unwrap_or_else(|| panic!("policy not found"));
@@ -312,6 +412,12 @@ impl PolicyEngine {
 
         let dm_address = Self::get_delegation_manager(env.clone());
         let dm_client = delegation_manager_client::DelegationManagerClient::new(&env, &dm_address);
+        
+        // Delegation activity validation
+        if !dm_client.is_active_delegation(&delegation_id) {
+            panic!("cannot assign policy to an inactive delegation");
+        }
+
         let del_owner = dm_client.get_owner(&delegation_id)
             .unwrap_or_else(|| panic!("delegation not found"));
 
@@ -321,6 +427,7 @@ impl PolicyEngine {
 
         policy.delegation_id = Some(delegation_id);
         env.storage().persistent().set(&key, &policy);
+        bump_ttl(&env, &key);
 
         // Add to DelegationPolicies
         let list_key = DataKey::DelegationPolicies(delegation_id);
@@ -328,10 +435,23 @@ impl PolicyEngine {
             .unwrap_or_else(|| Vec::new(&env));
         list.push_back(policy_id);
         env.storage().persistent().set(&list_key, &list);
+        bump_ttl(&env, &list_key);
 
-        // Set as active policy if policy is currently Active
+        // Set as active policy if policy is currently Active (multiple active policy prevention)
         if policy.status == PolicyStatus::Active {
-            env.storage().persistent().set(&DataKey::ActivePolicyId(delegation_id), &policy_id);
+            let active_key = DataKey::ActivePolicyId(delegation_id);
+            let now = env.ledger().timestamp();
+            if let Some(existing_id) = env.storage().persistent().get::<_, u64>(&active_key) {
+                if let Some(existing_policy) = Self::get_policy(env.clone(), existing_id) {
+                    let is_expired = existing_policy.status == PolicyStatus::Expired 
+                        || (existing_policy.params.valid_until.is_some() && existing_policy.params.valid_until.unwrap() <= now);
+                    if existing_policy.status == PolicyStatus::Active && !is_expired && existing_id != policy_id {
+                        panic!("delegation already has an active policy");
+                    }
+                }
+            }
+            env.storage().persistent().set(&active_key, &policy_id);
+            bump_ttl(&env, &active_key);
         }
 
         let now = env.ledger().timestamp();
@@ -342,6 +462,8 @@ impl PolicyEngine {
     }
 
     pub fn unassign_policy(env: Env, policy_id: u64) {
+        Self::ensure_not_expired(&env, policy_id);
+
         let key = DataKey::Policy(policy_id);
         let mut policy = env.storage().persistent().get::<_, Policy>(&key)
             .unwrap_or_else(|| panic!("policy not found"));
@@ -367,21 +489,33 @@ impl PolicyEngine {
                     }
                 }
                 env.storage().persistent().set(&list_key, &new_list);
+                bump_ttl(&env, &list_key);
             }
 
             policy.delegation_id = None;
             env.storage().persistent().set(&key, &policy);
+            bump_ttl(&env, &key);
         }
     }
 
     pub fn get_policy(env: Env, policy_id: u64) -> Option<Policy> {
-        env.storage().persistent().get::<_, Policy>(&DataKey::Policy(policy_id))
+        let key = DataKey::Policy(policy_id);
+        let val = env.storage().persistent().get::<_, Policy>(&key);
+        if val.is_some() {
+            bump_ttl(&env, &key);
+            Self::ensure_not_expired(&env, policy_id);
+            // Retrieve again to get updated status
+            return env.storage().persistent().get::<_, Policy>(&key);
+        }
+        val
     }
 
     pub fn get_policies_by_delegation(env: Env, delegation_id: u64) -> Vec<Policy> {
         let list_key = DataKey::DelegationPolicies(delegation_id);
         let list = env.storage().persistent().get::<_, Vec<u64>>(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
+        bump_ttl(&env, &list_key);
+
         let mut result = Vec::new(&env);
         for id in list {
             if let Some(policy) = Self::get_policy(env.clone(), id) {
@@ -392,8 +526,16 @@ impl PolicyEngine {
     }
 
     pub fn get_active_policy(env: Env, delegation_id: u64) -> Option<Policy> {
-        let active_id = env.storage().persistent().get::<_, u64>(&DataKey::ActivePolicyId(delegation_id))?;
-        Self::get_policy(env, active_id)
+        let active_key = DataKey::ActivePolicyId(delegation_id);
+        let active_id = env.storage().persistent().get::<_, u64>(&active_key)?;
+        bump_ttl(&env, &active_key);
+        Self::ensure_not_expired(&env, active_id);
+
+        let policy = Self::get_policy(env.clone(), active_id)?;
+        if policy.status == PolicyStatus::Expired {
+            return None;
+        }
+        Some(policy)
     }
 
     pub fn validate_action(
@@ -408,6 +550,7 @@ impl PolicyEngine {
             Some(addr) => addr,
             None => return ValidationResult::Rejected(String::from_str(&env, "Delegation Manager not initialized")),
         };
+        bump_ttl(&env, &DataKey::DelegationManager);
         let dm_client = delegation_manager_client::DelegationManagerClient::new(&env, &dm_address);
 
         if !dm_client.delegation_exists(&delegation_id) {
@@ -421,11 +564,17 @@ impl PolicyEngine {
             Some(id) => id,
             None => return ValidationResult::Rejected(String::from_str(&env, "no active policy assigned")),
         };
+        bump_ttl(&env, &DataKey::ActivePolicyId(delegation_id));
+        Self::ensure_not_expired(&env, policy_id);
 
         let policy = match Self::get_policy(env.clone(), policy_id) {
             Some(p) => p,
             None => return ValidationResult::Rejected(String::from_str(&env, "policy not found")),
         };
+
+        if policy.status == PolicyStatus::Expired {
+            return ValidationResult::Rejected(String::from_str(&env, "policy expired"));
+        }
 
         if policy.status != PolicyStatus::Active {
             return ValidationResult::Rejected(String::from_str(&env, "policy not active"));
@@ -487,8 +636,15 @@ impl PolicyEngine {
         }
 
         let day_id = timestamp / 86400;
-        let spent = env.storage().persistent().get::<_, u128>(&DataKey::DailyNotional(policy_id, day_id)).unwrap_or(0);
-        if spent + amount > policy.params.max_notional_per_day {
+        let daily_key = DataKey::DailyNotional(policy_id, day_id);
+        let spent = env.storage().persistent().get::<_, u128>(&daily_key).unwrap_or(0);
+        bump_ttl(&env, &daily_key);
+
+        let new_spent = match spent.checked_add(amount) {
+            Some(s) => s,
+            None => return ValidationResult::Rejected(String::from_str(&env, "spent overflow")),
+        };
+        if new_spent > policy.params.max_notional_per_day {
             return ValidationResult::Rejected(String::from_str(&env, "amount exceeds daily limit"));
         }
 
@@ -502,12 +658,18 @@ impl PolicyEngine {
 
         let active_id = env.storage().persistent().get::<_, u64>(&DataKey::ActivePolicyId(delegation_id))
             .unwrap_or_else(|| panic!("no active policy assigned"));
+        bump_ttl(&env, &DataKey::ActivePolicyId(delegation_id));
+        Self::ensure_not_expired(&env, active_id);
+
         let day_id = timestamp / 86400;
         let daily_key = DataKey::DailyNotional(active_id, day_id);
         let spent = env.storage().persistent().get::<_, u128>(&daily_key).unwrap_or(0);
-        env.storage().persistent().set(&daily_key, &(spent + amount));
+        let new_spent = spent.checked_add(amount).expect("spent overflow");
+        env.storage().persistent().set(&daily_key, &new_spent);
+        bump_ttl(&env, &daily_key);
     }
 }
 
 #[cfg(test)]
 mod test;
+

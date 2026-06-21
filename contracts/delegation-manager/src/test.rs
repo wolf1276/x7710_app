@@ -2,7 +2,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    Address, Env, String, Vec,
+    Address, Env, String, Symbol, Vec, TryFromVal,
 };
 
 fn set_ledger_time(env: &Env, timestamp: u64) {
@@ -109,10 +109,11 @@ fn test_lifecycle_and_validation() {
     // 6. Expiry test
     set_ledger_time(&env, 5000); // 5000 is > 4600 expiry time
     assert!(client.is_expired(&id));
-    assert!(!client.is_active_delegation(&id));
 
     // Run check_and_expire to update state explicitly to Expired
     assert!(client.check_and_expire(&id));
+    assert!(!client.is_active_delegation(&id));
+
     let delegation = client.get_delegation(&id).unwrap();
     assert_eq!(delegation.status, DelegationStatus::Expired);
     assert_eq!(delegation.version, 6);
@@ -264,10 +265,24 @@ fn test_events() {
     };
 
     env.mock_all_auths();
-    let _id = client.create_delegation(&owner, &delegate, &metadata, &None);
+    let id = client.create_delegation(&owner, &delegate, &metadata, &None);
 
     let all_events = env.events().all();
     assert!(all_events.len() > 0);
+
+    // Verify explicit event name delegation_created
+    let event = all_events.get(0).unwrap();
+    let topics = event.1;
+    let name_val = topics.get(0).unwrap();
+    let name = Symbol::try_from_val(&env, &name_val).unwrap();
+    assert_eq!(name, Symbol::new(&env, "delegation_created"));
+
+    client.accept_delegation(&id);
+    let all_events = env.events().all();
+    let event = all_events.get(all_events.len() - 1).unwrap();
+    let accept_name_val = event.1.get(0).unwrap();
+    let accept_name = Symbol::try_from_val(&env, &accept_name_val).unwrap();
+    assert_eq!(accept_name, Symbol::new(&env, "delegation_accepted"));
 }
 
 #[test]
@@ -348,11 +363,51 @@ fn test_new_apis() {
     assert!(client.verify_authority(&owner, &delegate));
     assert!(client.get_active_delegation(&owner, &delegate).is_some());
 
-    // 6. Expired
+    // 6. Expired (Lazy transition test)
     set_ledger_time(&env, 2500); // Beyond 2000
     assert!(!client.verify_authority(&owner, &delegate));
     assert!(client.get_active_delegation(&owner, &delegate).is_none());
     assert!(!client.is_delegation_valid(&id));
+
+    // Stale mapping check: get_active_delegation_id should return None now
+    assert!(client.get_active_delegation_id(&owner, &delegate).is_none());
 }
 
+#[test]
+fn test_lazy_expiry_transition_and_stale_mapping() {
+    let env = Env::default();
+    set_ledger_time(&env, 1000);
 
+    let contract_id = env.register(DelegationManager, ());
+    let client = DelegationManagerClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let delegate = Address::generate(&env);
+
+    let tags = Vec::new(&env);
+    let metadata = DelegationMetadata {
+        label: String::from_str(&env, "Agent Expiring"),
+        strategy_id: None,
+        description: None,
+        tags,
+    };
+
+    env.mock_all_auths();
+    let id = client.create_delegation(&owner, &delegate, &metadata, &Some(2000));
+    client.accept_delegation(&id);
+
+    assert_eq!(client.get_active_delegation_id(&owner, &delegate), Some(id));
+
+    // Advance time beyond 2000 expiry
+    set_ledger_time(&env, 3000);
+
+    // Call verify_authority, should return false and trigger lazy expiry
+    assert!(!client.verify_authority(&owner, &delegate));
+
+    // Check that state updated to Expired
+    let delegation = client.get_delegation(&id).unwrap();
+    assert_eq!(delegation.status, DelegationStatus::Expired);
+
+    // Check mapping cleaned up
+    assert!(client.get_active_delegation_id(&owner, &delegate).is_none());
+}

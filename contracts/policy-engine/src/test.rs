@@ -351,3 +351,132 @@ fn test_record_action_fails_without_router() {
 
     client.record_action(&1, &100, &1000);
 }
+
+#[test]
+#[should_panic(expected = "cannot assign policy to an inactive delegation")]
+fn test_assign_policy_inactive_delegation_fails() {
+    let env = Env::default();
+    set_ledger_time(&env, 1000);
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let dm_address = env.register(MockDelegationManager, ());
+    let dm_client = MockDelegationManagerClient::new(&env, &dm_address);
+    // Mock delegation exists but NOT active
+    let owner = Address::generate(&env);
+    dm_client.set_delegation(&1, &true, &false, &owner);
+
+    let contract_id = env.register(PolicyEngine, ());
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.initialize(&dm_address, &admin);
+
+    let allowed_assets = Vec::new(&env);
+    let denied_assets = Vec::new(&env);
+    let allowed_protocols = Vec::new(&env);
+    let denied_protocols = Vec::new(&env);
+    let params = PolicyParams {
+        strategy_id: Some(1),
+        valid_from: 1000,
+        valid_until: Some(5000),
+        max_notional_per_tx: 500,
+        max_notional_per_day: 2000,
+        allowed_assets,
+        denied_assets,
+        allowed_protocols,
+        denied_protocols,
+        metadata: String::from_str(&env, "Test Policy"),
+    };
+    let delegate = Address::generate(&env);
+    let policy_id = client.create_policy(&owner, &delegate, &params);
+    client.accept_policy(&policy_id);
+
+    client.assign_policy_to_delegation(&policy_id, &1);
+}
+
+#[test]
+#[should_panic(expected = "delegation already has an active policy")]
+fn test_prevent_multiple_active_policies() {
+    let env = Env::default();
+    set_ledger_time(&env, 1000);
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let delegate = Address::generate(&env);
+    let dm_address = env.register(MockDelegationManager, ());
+    let dm_client = MockDelegationManagerClient::new(&env, &dm_address);
+    dm_client.set_delegation(&1, &true, &true, &owner);
+
+    let contract_id = env.register(PolicyEngine, ());
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.initialize(&dm_address, &admin);
+
+    let params = PolicyParams {
+        strategy_id: Some(1),
+        valid_from: 1000,
+        valid_until: Some(5000),
+        max_notional_per_tx: 500,
+        max_notional_per_day: 2000,
+        allowed_assets: Vec::new(&env),
+        denied_assets: Vec::new(&env),
+        allowed_protocols: Vec::new(&env),
+        denied_protocols: Vec::new(&env),
+        metadata: String::from_str(&env, "Test Policy"),
+    };
+
+    let p1 = client.create_policy(&owner, &delegate, &params);
+    client.accept_policy(&p1);
+    client.assign_policy_to_delegation(&p1, &1);
+
+    let p2 = client.create_policy(&owner, &delegate, &params);
+    client.accept_policy(&p2);
+    // This assignment should panic because delegation ID 1 already has an active policy p1
+    client.assign_policy_to_delegation(&p2, &1);
+}
+
+#[test]
+fn test_lazy_policy_expiry() {
+    let env = Env::default();
+    set_ledger_time(&env, 1000);
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let delegate = Address::generate(&env);
+    let dm_address = env.register(MockDelegationManager, ());
+    let dm_client = MockDelegationManagerClient::new(&env, &dm_address);
+    dm_client.set_delegation(&1, &true, &true, &owner);
+
+    let contract_id = env.register(PolicyEngine, ());
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.initialize(&dm_address, &admin);
+
+    let params = PolicyParams {
+        strategy_id: Some(1),
+        valid_from: 1000,
+        valid_until: Some(2000), // Expiry at 2000
+        max_notional_per_tx: 500,
+        max_notional_per_day: 2000,
+        allowed_assets: Vec::new(&env),
+        denied_assets: Vec::new(&env),
+        allowed_protocols: Vec::new(&env),
+        denied_protocols: Vec::new(&env),
+        metadata: String::from_str(&env, "Test Policy"),
+    };
+
+    let p1 = client.create_policy(&owner, &delegate, &params);
+    client.accept_policy(&p1);
+    client.assign_policy_to_delegation(&p1, &1);
+
+    assert!(client.get_active_policy(&1).is_some());
+
+    // Advance time beyond valid_until (2000)
+    set_ledger_time(&env, 3000);
+
+    // get_active_policy should return None and transition the policy status to Expired lazily
+    assert!(client.get_active_policy(&1).is_none());
+
+    let policy = client.get_policy(&p1).unwrap();
+    assert_eq!(policy.status, PolicyStatus::Expired);
+}
+

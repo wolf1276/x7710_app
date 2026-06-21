@@ -215,6 +215,9 @@ impl ExecutionRouter {
     }
 
     pub fn execute_intent(env: Env, intent: ExecutionIntent) -> u64 {
+        // Enforce delegate authorization
+        intent.delegate.require_auth();
+
         // 1. validate_execution()
         let validation = Self::validate_execution(env.clone(), intent.clone());
 
