@@ -1,0 +1,5 @@
+# Ignore all environment variables in this folder
+*.local
+.env
+.env.*
+!.env.example
